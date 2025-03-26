@@ -5,7 +5,7 @@ use chrono::Utc;
 use clap::Parser;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::{Value, to_string as json_to_string, from_str as json_from_str};
+use serde_json::{Value, from_str as json_from_str, to_string as json_to_string};
 use sqlx::{
     Error as SqlxError, Executor, Sqlite, SqlitePool, query as sqlx_query,
     sqlite::SqliteConnectOptions,
@@ -13,11 +13,9 @@ use sqlx::{
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 
-const DATABASE_URL: &str = "connections.db";
-
 /// 命令行参数配置
 #[derive(Parser, Debug)]
-#[clap(version = "1.0", author = "Your Name")]
+#[clap(version = "0.1.1", author = "djkcyl")]
 struct Args {
     /// API服务器主机地址
     #[clap(long, default_value = "127.0.0.1")]
@@ -30,11 +28,16 @@ struct Args {
     /// 认证令牌
     #[clap(long, default_value = "")]
     token: String,
+
+    /// SQLite 数据库路径
+    #[clap(long, default_value = "connections.db")]
+    database: String,
 }
 
 /// Structs to deserialize the incoming JSON.
 #[derive(Deserialize, Debug)]
 struct GlobalData {
+    #[serde(deserialize_with = "deserialize_connections")]
     connections: Vec<Connection>,
 }
 
@@ -45,6 +48,7 @@ struct Connection {
     upload: i64,
     start: String, // ISO8601 string
     metadata: ConnectionMetadata,
+    #[serde(deserialize_with = "deserialize_chains")]
     chains: Vec<String>,
     rule: String,
     #[serde(rename = "rulePayload")]
@@ -109,9 +113,9 @@ struct ConnectionTracker {
 
 impl ConnectionTracker {
     /// Initialize the database and caches.
-    async fn new() -> Result<Self, SqlxError> {
+    async fn new(database_path: &str) -> Result<Self, SqlxError> {
         let options = SqliteConnectOptions::new()
-            .filename(DATABASE_URL)
+            .filename(database_path)
             .create_if_missing(true);
         let pool = SqlitePool::connect_with(options).await?;
 
@@ -167,8 +171,6 @@ impl ConnectionTracker {
     /// Close the connection tracker.
     async fn close(&mut self) {
         self.running = false;
-        // The pool will be closed when it is dropped.
-        println!("Tracker closed.");
     }
 
     /// Upsert a single connection record into the database.
@@ -178,7 +180,7 @@ impl ConnectionTracker {
     {
         let last_updated = Utc::now().to_rfc3339();
         let start = conn.start.clone();
-        let chains = conn.chains.join("->");
+        let chains = json_to_string(&conn.chains).unwrap_or_else(|_| "[]".to_string());
         let source_geoip =
             json_to_string(&conn.metadata.source_geoip).unwrap_or_else(|_| "{}".to_string());
         let destination_geoip =
@@ -338,8 +340,6 @@ impl ConnectionTracker {
         if !changed_conns.is_empty() {
             let mut tx = self.pool.begin().await?;
             for conn in &changed_conns {
-                // 倒序 conn.chains
-
                 self.upsert_connection(&mut tx, conn).await?;
             }
             tx.commit().await?;
@@ -351,10 +351,27 @@ impl ConnectionTracker {
     }
 }
 
+fn deserialize_connections<'de, D>(deserializer: D) -> Result<Vec<Connection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Vec<Connection>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+fn deserialize_chains<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut chains: Vec<String> = Vec::deserialize(deserializer)?;
+    chains.reverse();
+    Ok(chains)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut tracker = ConnectionTracker::new().await?;
+    let mut tracker = ConnectionTracker::new(&args.database).await?;
     let ws_uri = format!(
         "ws://{}:{}/connections?token={}",
         args.host, args.port, args.token
@@ -389,8 +406,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(Some(Ok(message))) => {
                                             if message.is_text() {
                                                 let text = message.into_text()?;
-                                                let data: GlobalData = json_from_str(&text)?;
-                                                tracker.update_connections(data).await?;
+                                                match json_from_str::<GlobalData>(&text) {
+                                                    Ok(data) => {
+                                                        if let Err(e) = tracker.update_connections(data).await {
+                                                            println!("Update error: {:?}", e);
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        println!("Failed to deserialize message: {}\nRaw data: {}", e, text);
+                                                    }
+                                                };
                                             }
                                         },
                                         Ok(Some(Err(e))) => {
@@ -415,7 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     Err(e) => {
                         println!("Connection error: {:?}, retrying...", e);
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
