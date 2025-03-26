@@ -31,7 +31,7 @@
 
 1. 克隆仓库：
 ```bash
-git clone https://github.com/yourusername/mihomo-connections-tracker.git
+git clone https://github.com/djkcyl/mihomo-connections-tracker.git
 cd mihomo-connections-tracker
 ```
 
