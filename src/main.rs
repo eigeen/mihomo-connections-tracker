@@ -2,15 +2,35 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::Utc;
+use clap::Parser;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::Value;
-use sqlx::{Executor, SqlitePool, sqlite::SqliteConnectOptions};
+use serde_json::{Value, to_string as json_to_string, from_str as json_from_str};
+use sqlx::{
+    Error as SqlxError, Executor, Sqlite, SqlitePool, query as sqlx_query,
+    sqlite::SqliteConnectOptions,
+};
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 
-const TOKEN: &str = ""; // Set your token here
 const DATABASE_URL: &str = "connections.db";
+
+/// 命令行参数配置
+#[derive(Parser, Debug)]
+#[clap(version = "1.0", author = "Your Name")]
+struct Args {
+    /// API服务器主机地址
+    #[clap(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// API服务器端口号
+    #[clap(long, default_value = "9090")]
+    port: u16,
+
+    /// 认证令牌
+    #[clap(long, default_value = "")]
+    token: String,
+}
 
 /// Structs to deserialize the incoming JSON.
 #[derive(Deserialize, Debug)]
@@ -81,7 +101,7 @@ struct ConnectionMetadata {
 /// ConnectionTracker handles maintaining a cache of flows,
 /// the set of active connections, and updating the database.
 struct ConnectionTracker {
-    pool: sqlx::SqlitePool,
+    pool: SqlitePool,
     flow_cache: HashMap<String, (i64, i64)>, // id -> (download, upload)
     active_connections: HashSet<String>,
     running: bool,
@@ -89,7 +109,7 @@ struct ConnectionTracker {
 
 impl ConnectionTracker {
     /// Initialize the database and caches.
-    async fn new() -> Result<Self, sqlx::Error> {
+    async fn new() -> Result<Self, SqlxError> {
         let options = SqliteConnectOptions::new()
             .filename(DATABASE_URL)
             .create_if_missing(true);
@@ -152,19 +172,19 @@ impl ConnectionTracker {
     }
 
     /// Upsert a single connection record into the database.
-    async fn upsert_connection<'a, E>(&self, exec: E, conn: &Connection) -> Result<(), sqlx::Error>
+    async fn upsert_connection<'a, E>(&self, exec: E, conn: &Connection) -> Result<(), SqlxError>
     where
-        E: Executor<'a, Database = sqlx::Sqlite>,
+        E: Executor<'a, Database = Sqlite>,
     {
         let last_updated = Utc::now().to_rfc3339();
         let start = conn.start.clone();
         let chains = conn.chains.join("->");
         let source_geoip =
-            serde_json::to_string(&conn.metadata.source_geoip).unwrap_or_else(|_| "{}".to_string());
-        let destination_geoip = serde_json::to_string(&conn.metadata.destination_geoip)
-            .unwrap_or_else(|_| "{}".to_string());
+            json_to_string(&conn.metadata.source_geoip).unwrap_or_else(|_| "{}".to_string());
+        let destination_geoip =
+            json_to_string(&conn.metadata.destination_geoip).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
+        sqlx_query(
             r#"
             INSERT INTO connections (
                 id, conn_download, conn_upload, last_updated, start, network, type,
@@ -333,9 +353,14 @@ impl ConnectionTracker {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
     let mut tracker = ConnectionTracker::new().await?;
-    let ws_uri = format!("ws://127.0.0.1:9090/connections?token={}", TOKEN);
+    let ws_uri = format!(
+        "ws://{}:{}/connections?token={}",
+        args.host, args.port, args.token
+    );
 
+    println!("Connecting to mihomo API at {}:{}...", args.host, args.port);
     println!("Press Ctrl+C to shut down gracefully.");
 
     // Main loop: connect to the websocket and process incoming messages.
@@ -364,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(Some(Ok(message))) => {
                                             if message.is_text() {
                                                 let text = message.into_text()?;
-                                                let data: GlobalData = serde_json::from_str(&text)?;
+                                                let data: GlobalData = json_from_str(&text)?;
                                                 tracker.update_connections(data).await?;
                                             }
                                         },
