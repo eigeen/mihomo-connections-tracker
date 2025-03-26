@@ -1,32 +1,43 @@
+name: Rust CI
+
 on:
   release:
     types: [created]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
-    name: release ${{ matrix.target }}
-    runs-on: ubuntu-latest
+  release-build:
+    if: github.event_name == 'release'
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - target: x86_64-pc-windows-gnu
-            archive: zip
-          - target: x86_64-unknown-linux-musl
-            archive: tar.gz
-          - target: x86_64-apple-darwin
-            archive: zip
+        target: [x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin]
+    
+    runs-on: ${{ matrix.platform.os }}
     steps:
-      - uses: actions/checkout@master
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-      - name: Compile and release
-        uses: rust-build/rust-build.action@v1.4.5
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.platform.target }}
+      
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.platform.target }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.platform.target }}
+      
+      - name: Rename binary
+        run: |
+          mkdir release
+          BIN_NAME=$(basename $(pwd))
+          cp target/${{ matrix.platform.target }}/release/$BIN_NAME${{ matrix.platform.ext }} release/$BIN_NAME-${{ matrix.platform.target }}${{ matrix.platform.ext }}
+      
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          RUSTTARGET: ${{ matrix.target }}
-          ARCHIVE_TYPES: ${{ matrix.archive }}
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./release/$BIN_NAME-${{ matrix.platform.target }}${{ matrix.platform.ext }}
+          asset_name: $BIN_NAME-${{ matrix.platform.target }}${{ matrix.platform.ext }}
+          asset_content_type: application/octet-stream
