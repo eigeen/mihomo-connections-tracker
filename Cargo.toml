@@ -1,6 +1,6 @@
 [package]
 edition = "2024"
-name = "mihomo_record"
+name = "mihomo-connections-tracker"
 version = "0.1.0"
 
 [profile.release]
