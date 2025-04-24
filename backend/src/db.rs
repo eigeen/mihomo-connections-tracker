@@ -320,18 +320,71 @@ impl Database {
         // 转换结果为JSON数组
         let mut results = Vec::new();
         for row in rows {
-            let group_key: String = row.get(0);
-            let count: i64 = row.get(1);
-            let download: Option<i64> = row.try_get(2).unwrap_or(Some(0));
-            let upload: Option<i64> = row.try_get(3).unwrap_or(Some(0));
+            // 灵活处理不同类型的分组字段
+            let mut result_obj = serde_json::Map::new();
             
-            results.push(serde_json::json!({
-                "key": group_key,
-                "count": count,
-                "download": download.unwrap_or(0),
-                "upload": upload.unwrap_or(0),
-                "total": download.unwrap_or(0) + upload.unwrap_or(0)
-            }));
+            // 处理规则和rule_payload的情况 - 这时row有两个列作为分组键
+            if sql.contains("GROUP BY rule, rule_payload") {
+                if let Ok(rule) = row.try_get::<String, _>(0) {
+                    result_obj.insert("rule".to_string(), serde_json::Value::String(rule));
+                }
+                if let Ok(payload) = row.try_get::<String, _>(1) {
+                    result_obj.insert("rule_payload".to_string(), serde_json::Value::String(payload));
+                }
+                
+                // 此时count, download, upload的列索引会右移
+                if let Ok(count) = row.try_get::<i64, _>(2) {
+                    result_obj.insert("count".to_string(), serde_json::Value::Number(count.into()));
+                }
+                if let Ok(download) = row.try_get::<i64, _>(3) {
+                    result_obj.insert("download".to_string(), serde_json::Value::Number(download.into()));
+                }
+                if let Ok(upload) = row.try_get::<i64, _>(4) {
+                    result_obj.insert("upload".to_string(), serde_json::Value::Number(upload.into()));
+                }
+                
+                // 计算总流量
+                let download = row.try_get::<i64, _>(3).unwrap_or(0);
+                let upload = row.try_get::<i64, _>(4).unwrap_or(0);
+                result_obj.insert("total".to_string(), serde_json::Value::Number((download + upload).into()));
+            } else {
+                // 标准的单列分组情况
+                // 尝试多种类型获取分组键
+                let group_key = match row.try_get::<String, _>(0) {
+                    Ok(val) => serde_json::Value::String(val),
+                    Err(_) => match row.try_get::<i64, _>(0) {
+                        Ok(val) => serde_json::Value::Number(val.into()),
+                        Err(_) => match row.try_get::<f64, _>(0) {
+                            Ok(val) => serde_json::json!(val),
+                            Err(_) => serde_json::Value::Null,
+                        },
+                    },
+                };
+                
+                // 提取列名并设置为键
+                if let Some(col_name) = sql.split("SELECT ").nth(1).and_then(|s| s.split(',').next()) {
+                    let col_name = col_name.trim();
+                    result_obj.insert(col_name.to_string(), group_key);
+                }
+                
+                // 标准统计列
+                if let Ok(count) = row.try_get::<i64, _>(1) {
+                    result_obj.insert("count".to_string(), serde_json::Value::Number(count.into()));
+                }
+                if let Ok(download) = row.try_get::<i64, _>(2) {
+                    result_obj.insert("download".to_string(), serde_json::Value::Number(download.into()));
+                }
+                if let Ok(upload) = row.try_get::<i64, _>(3) {
+                    result_obj.insert("upload".to_string(), serde_json::Value::Number(upload.into()));
+                }
+                
+                // 计算总流量
+                let download = row.try_get::<i64, _>(2).unwrap_or(0);
+                let upload = row.try_get::<i64, _>(3).unwrap_or(0);
+                result_obj.insert("total".to_string(), serde_json::Value::Number((download + upload).into()));
+            }
+            
+            results.push(serde_json::Value::Object(result_obj));
         }
         
         Ok(results)

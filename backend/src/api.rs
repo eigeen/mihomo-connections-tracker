@@ -11,6 +11,8 @@ use warp::http::StatusCode;
 use warp::reply::Json;
 use serde_json::json;
 use serde::{Deserialize, Serialize};
+use warp::http::Method;
+use warp::http::header::{AUTHORIZATION, CONTENT_TYPE};
 
 // Mihomo API客户端
 pub struct MihomoClient {
@@ -225,12 +227,19 @@ impl MasterServer {
             .and_then(|query: StatsQuery, db: Arc<crate::db::Database>| async move {
                 handle_stats(query, db).await
             });
+
+        // 配置 CORS
+        let cors = warp::cors()
+            .allow_any_origin()
+            .allow_methods(vec![Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers(vec![CONTENT_TYPE, AUTHORIZATION])
+            .allow_credentials(false);
             
-        // 合并所有路由并添加错误处理
+        // 合并所有路由并添加 CORS 和错误处理
         let routes = health_route
             .or(sync_route)
             .or(stats_route)
-            .with(warp::cors().allow_any_origin())
+            .with(cors)
             .recover(handle_rejection);
             
         println!("启动主节点API服务器在 {}:{}...", host, port);
@@ -347,36 +356,65 @@ async fn handle_stats_group(
     };
     
     // 确定分组字段对应的数据库列名
-    let column_name = match group_field {
-        "network" => "network",
-        "rule" => "rule",
-        "process" => "process",
-        "destination" => "destination_ip",
-        "geoip" => "destination_geoip",
+    let (column_name, is_chains_field) = match group_field {
+        "network" => ("network", false),
+        "rule" => ("rule", false),
+        "process" => ("process", false),
+        "destination" => ("destination_ip", false),
+        "geoip" => ("destination_geoip", false),
+        "host" => ("host", false),
+        "chains" => ("chains", true), // 特殊处理，需要提取最后一个节点
         _ => return Err(warp::reject::custom(ApiError::BadRequest(
             format!("不支持的分组字段: {}", group_field)
         )))
     };
     
-    // 确定查询函数
-    let _use_geoip_query = group_field == "geoip";
+    // 对于rule字段，我们需要做特殊处理，合并rule和rule_payload
+    let use_combined_rule = group_field == "rule";
     
-    // 构建SQL查询
-    let base_sql = format!(
-        "SELECT {}, COUNT(*) as count, SUM(conn_download) as download, SUM(conn_upload) as upload FROM connections",
-        column_name
-    );
+    // 如果是chains字段，我们需要自定义SQL查询来提取最后一个节点
+    let base_sql = if use_combined_rule {
+        // 如果是按规则分组，我们合并rule和rule_payload字段
+        format!(
+            "SELECT rule, rule_payload, COUNT(*) as count, SUM(conn_download) as download, SUM(conn_upload) as upload FROM connections"
+        )
+    } else if is_chains_field {
+        // 对于chains字段，需要提取最后一个节点
+        // 注：此处使用SQLite的JSON函数，提取数组的最后一个元素
+        // SQLite 3.38.0及以上版本支持使用负索引 $[-1]
+        // 但我们使用更安全的方法，先获取数组为JSON文本，然后在Rust中处理
+        format!(
+            "SELECT 
+                chains,
+                COUNT(*) as count, 
+                SUM(conn_download) as download, 
+                SUM(conn_upload) as upload 
+             FROM connections"
+        )
+    } else {
+        format!(
+            "SELECT {}, COUNT(*) as count, SUM(conn_download) as download, SUM(conn_upload) as upload FROM connections",
+            column_name
+        )
+    };
     
     let (mut sql, params) = build_base_filter(&base_sql, &query);
     
     // 添加分组和排序
-    sql.push_str(&format!(" GROUP BY {}", column_name));
+    if use_combined_rule {
+        sql.push_str(" GROUP BY rule, rule_payload"); // 按两个字段分组
+    } else if is_chains_field {
+        sql.push_str(" GROUP BY chains"); // 按chains分组
+    } else {
+        sql.push_str(&format!(" GROUP BY {}", column_name));
+    }
     
     if let Some(sort_by) = &query.sort_by {
         let sort_field = match sort_by.as_str() {
             "count" => "count",
             "download" => "download",
             "upload" => "upload",
+            "total" => "(download + upload)",
             _ => "count"
         };
         
@@ -387,7 +425,18 @@ async fn handle_stats_group(
         
         sql.push_str(&format!(" ORDER BY {} {}", sort_field, sort_order));
     } else {
-        sql.push_str(" ORDER BY count DESC");
+        // 默认排序 - 根据分组类型可能想要不同的默认排序
+        if let Some(metric) = &query.metric {
+            match metric.as_str() {
+                "connections" => sql.push_str(" ORDER BY count DESC"),
+                "download" => sql.push_str(" ORDER BY download DESC"),
+                "upload" => sql.push_str(" ORDER BY upload DESC"),
+                "total" => sql.push_str(" ORDER BY (download + upload) DESC"),
+                _ => sql.push_str(" ORDER BY count DESC")
+            }
+        } else {
+            sql.push_str(" ORDER BY count DESC");
+        }
     }
     
     // 添加限制
@@ -397,7 +446,150 @@ async fn handle_stats_group(
     
     // 执行查询
     match db.execute_group_query(&sql, &params).await {
-        Ok(results) => {
+        Ok(mut results) => {
+            // 对于 rule 分组，我们需要在结果中合并 rule 和 rule_payload
+            if use_combined_rule {
+                results = results.into_iter().map(|mut item| {
+                    if let Some(obj) = item.as_object_mut() {
+                        // 获取 rule 和 rule_payload
+                        let rule = obj.get("rule").and_then(|r| r.as_str()).unwrap_or("").to_string();
+                        let payload = obj.get("rule_payload").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                        
+                        // 创建组合规则值
+                        let combined_rule = if !payload.is_empty() {
+                            format!("{} ({})", rule, payload)
+                        } else {
+                            rule
+                        };
+                        
+                        // 更新 rule 字段并删除 rule_payload
+                        obj.insert("rule".to_string(), serde_json::Value::String(combined_rule));
+                        obj.remove("rule_payload");
+                    }
+                    item
+                }).collect();
+            }
+            
+            // 如果是chains分组，需要将last_node重命名为node
+            if is_chains_field {
+                results = results.into_iter().map(|mut item| {
+                    if let Some(obj) = item.as_object_mut() {
+                        if let Some(chains_value) = obj.remove("chains") {
+                            // 从chains中提取最后一个节点
+                            let node_value = if let Some(chains_str) = chains_value.as_str() {
+                                // 尝试解析JSON数组并获取最后一个元素
+                                let clean_chains = chains_str.trim().replace('\'', "\"");
+                                if let Ok(array) = serde_json::from_str::<Vec<String>>(&clean_chains) {
+                                    if !array.is_empty() {
+                                        serde_json::Value::String(array.last().unwrap().clone())
+                                    } else {
+                                        serde_json::Value::String("unknown".to_string())
+                                    }
+                                } else {
+                                    // 如果解析失败，保留原始值
+                                    serde_json::Value::String(chains_str.to_string())
+                                }
+                            } else {
+                                // 如果不是字符串，保留原始值
+                                chains_value
+                            };
+                            
+                            obj.insert("node".to_string(), node_value);
+                        }
+                    }
+                    item
+                }).collect();
+                
+                // 对结果按节点名称进行聚合
+                let mut node_stats: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+                
+                for item in results {
+                    if let Some(obj) = item.as_object() {
+                        if let (Some(node), Some(count), Some(download), Some(upload)) = (
+                            obj.get("node").and_then(|v| v.as_str()),
+                            obj.get("count").and_then(|v| v.as_i64()),
+                            obj.get("download").and_then(|v| v.as_i64()),
+                            obj.get("upload").and_then(|v| v.as_i64())
+                        ) {
+                            let entry = node_stats.entry(node.to_string()).or_insert_with(|| {
+                                serde_json::json!({
+                                    "node": node,
+                                    "count": 0,
+                                    "download": 0,
+                                    "upload": 0
+                                })
+                            });
+                            
+                            if let Some(entry_obj) = entry.as_object_mut() {
+                                // 更新计数
+                                if let Some(entry_count) = entry_obj.get("count").and_then(|v| v.as_i64()) {
+                                    entry_obj["count"] = serde_json::Value::Number(serde_json::Number::from(entry_count + count));
+                                }
+                                
+                                // 更新下载
+                                if let Some(entry_download) = entry_obj.get("download").and_then(|v| v.as_i64()) {
+                                    entry_obj["download"] = serde_json::Value::Number(serde_json::Number::from(entry_download + download));
+                                }
+                                
+                                // 更新上传
+                                if let Some(entry_upload) = entry_obj.get("upload").and_then(|v| v.as_i64()) {
+                                    entry_obj["upload"] = serde_json::Value::Number(serde_json::Number::from(entry_upload + upload));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 转换回列表并排序
+                let mut aggregated_results: Vec<serde_json::Value> = node_stats.values().cloned().collect();
+                
+                // 根据排序字段排序
+                if let Some(sort_by) = &query.sort_by {
+                    let sort_field = match sort_by.as_str() {
+                        "count" => "count",
+                        "download" => "download",
+                        "upload" => "upload",
+                        "total" => "total", // 这里会使用下面添加的total字段
+                        _ => "count"
+                    };
+                    
+                    let sort_order = match query.sort_order.as_deref() {
+                        Some("asc") => true,
+                        _ => false  // 默认降序
+                    };
+                    
+                    aggregated_results.sort_by(|a, b| {
+                        let a_val = a.get(sort_field).and_then(|v| v.as_i64()).unwrap_or(0);
+                        let b_val = b.get(sort_field).and_then(|v| v.as_i64()).unwrap_or(0);
+                        
+                        if sort_order {
+                            a_val.cmp(&b_val)  // 升序
+                        } else {
+                            b_val.cmp(&a_val)  // 降序
+                        }
+                    });
+                }
+                
+                // 应用limit
+                if let Some(limit) = query.limit {
+                    if (limit as usize) < aggregated_results.len() {
+                        aggregated_results.truncate(limit as usize);
+                    }
+                }
+                
+                results = aggregated_results;
+            }
+            
+            // 为每个结果添加 total 字段
+            results = results.into_iter().map(|mut item| {
+                if let Some(obj) = item.as_object_mut() {
+                    let download = obj.get("download").and_then(|d| d.as_i64()).unwrap_or(0);
+                    let upload = obj.get("upload").and_then(|u| u.as_i64()).unwrap_or(0);
+                    obj.insert("total".to_string(), serde_json::Value::Number(serde_json::Number::from(download + upload)));
+                }
+                item
+            }).collect();
+            
             Ok(ApiResponse::success(results))
         },
         Err(e) => {
