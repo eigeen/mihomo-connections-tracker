@@ -137,6 +137,7 @@ impl ConnectionState {
 
 // 从 Connection 转换为 ConnectionRecord
 pub fn connection_to_record(conn: &Connection, agent_id: Option<String>) -> ConnectionRecord {
+    // 确保使用UTC格式的ISO 8601时间
     let last_updated = Utc::now().to_rfc3339();
     let chains = serde_json::to_string(&conn.chains).unwrap_or_else(|_| "[]".to_string());
     let source_geoip = serde_json::to_string(&conn.metadata.source_geoip)
@@ -144,12 +145,29 @@ pub fn connection_to_record(conn: &Connection, agent_id: Option<String>) -> Conn
     let destination_geoip = serde_json::to_string(&conn.metadata.destination_geoip)
         .unwrap_or_else(|_| "{}".to_string());
 
+    // 确保start时间也是UTC格式
+    // 如果conn.start已经是UTC格式的RFC3339，则直接使用
+    // 否则尝试解析并转换为UTC格式
+    let start = if conn.start.ends_with('Z') || conn.start.contains('+') {
+        // 已经是ISO 8601格式，包含时区信息
+        conn.start.clone()
+    } else {
+        // 尝试解析为本地时间并转换为UTC
+        match chrono::DateTime::parse_from_str(&conn.start, "%Y-%m-%dT%H:%M:%S%.f") {
+            Ok(dt) => dt.with_timezone(&Utc).to_rfc3339(),
+            Err(_) => {
+                // 无法解析，保持原样
+                conn.start.clone()
+            }
+        }
+    };
+
     ConnectionRecord {
         id: conn.id.clone(),
         download: conn.download,
         upload: conn.upload,
         last_updated,
-        start: conn.start.clone(),
+        start,
         network: conn.metadata.network.clone(),
         conn_type: conn.metadata.conn_type.clone(),
         source_ip: conn.metadata.source_ip.clone(),

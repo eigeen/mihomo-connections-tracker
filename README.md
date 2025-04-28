@@ -81,7 +81,8 @@ Agent 节点连接本地 Mihomo 获取连接数据，并将数据发送到 Maste
   --master-url http://<master_ip>:9091 \
   --master-token your-secret-token \
   --local-database ./agent.db \
-  --agent-id my-unique-agent-id
+  --agent-id my-unique-agent-id \
+  --data-retention-days 7
 ```
 
 **Agent 节点参数说明:**
@@ -94,6 +95,7 @@ Agent 节点连接本地 Mihomo 获取连接数据，并将数据发送到 Maste
 *   `--local-database <PATH>`: (必需) Agent 本地数据库文件路径 (SQLite)，用于离线缓存。
 *   `--agent-id <ID>`: (必需) 当前 Agent 节点的唯一标识符。Master 通过此 ID 区分不同来源的数据。
 *   `--sync-interval <SECONDS>`: (可选) 向 Master 同步数据的间隔时间（秒，默认 60）。
+*   `--data-retention-days <DAYS>`: (可选) 数据保留天数，超过该天数的已同步数据会被自动删除（默认 7）。
 
 ## 离线模式
 

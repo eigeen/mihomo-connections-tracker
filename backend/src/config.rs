@@ -66,4 +66,8 @@ pub struct AgentConfig {
     /// 节点标识符
     #[clap(long)]
     pub agent_id: Option<String>,
+    
+    /// 数据保留天数（超过这个天数的已同步数据会被删除）
+    #[clap(long, default_value = "7")]
+    pub data_retention_days: i64,
 } 

@@ -150,10 +150,78 @@ impl<T: Serialize> ApiResponse<T> {
             "message": null
         }))
     }
+    
+    // 创建错误响应
+    fn error(message: &str) -> Json {
+        warp::reply::json(&json!({
+            "status": "error",
+            "data": null,
+            "message": message
+        }))
+    }
 }
 
-// 统一的API响应处理
+// 统一的API响应类型
 type ApiResult = Result<Json, warp::Rejection>;
+
+// API错误类型
+
+#[derive(Debug)]
+pub enum ApiError {
+    Unauthorized,                // 未授权
+    BadRequest(String),          // 请求参数错误
+    DatabaseError(String),       // 数据库错误
+    NotFound,                    // 资源不存在
+    InternalError(String),       // 内部服务器错误
+}
+
+impl warp::reject::Reject for ApiError {}
+
+// 统一的统计查询参数
+#[derive(Deserialize, Debug, Clone)]
+pub struct StatsQuery {
+    r#type: String,               // 统计类型: summary, group, timeseries
+    group_by: Option<String>,     // 分组字段(用于group类型): network, rule, process, destination, geoip
+    interval: Option<String>,     // 时间间隔(用于timeseries类型): hour, day, week, month
+    metric: Option<String>,       // 统计指标: connections, download, upload, total
+    from: Option<String>,         // 开始时间，ISO 8601格式
+    to: Option<String>,           // 结束时间，ISO 8601格式
+    agent_id: Option<String>,     // 代理ID过滤
+    network: Option<String>,      // 网络类型过滤
+    rule: Option<String>,         // 规则过滤
+    process: Option<String>,      // 进程名过滤
+    destination: Option<String>,  // 目标地址过滤
+    geoip: Option<String>,        // 国家/地区过滤
+    limit: Option<u32>,           // 限制返回结果数量
+    sort_by: Option<String>,      // 排序字段
+    sort_order: Option<String>,   // 排序顺序 (asc, desc)
+}
+
+// 连接查询参数
+#[derive(Deserialize, Debug, Clone)]
+pub struct ConnectionsQuery {
+    agent_id: Option<String>,     // 代理ID过滤
+    network: Option<String>,      // 网络类型过滤
+    rule: Option<String>,         // 规则过滤
+    process: Option<String>,      // 进程名过滤
+    destination: Option<String>,  // 目标地址过滤
+    host: Option<String>,         // 主机名过滤
+    geoip: Option<String>,        // 国家/地区过滤
+    from: Option<String>,         // 开始时间，ISO 8601格式
+    to: Option<String>,           // 结束时间，ISO 8601格式
+    limit: Option<u32>,           // 限制返回结果数量
+    offset: Option<u32>,          // 分页偏移量
+    sort_by: Option<String>,      // 排序字段
+    sort_order: Option<String>,   // 排序顺序 (asc, desc)
+}
+
+// 筛选器选项查询参数
+#[derive(Deserialize, Debug, Clone)]
+pub struct FilterOptionsQuery {
+    filter_type: String,          // 筛选类型: agent_id, network, rule, process, destination, host, geoip
+    query: Option<String>,        // 可选的查询字符串，用于搜索特定的选项
+    limit: Option<u32>,           // 限制返回结果数量
+}
 
 // 主节点API服务器
 pub struct MasterServer {
@@ -203,6 +271,23 @@ impl MasterServer {
 
     // 启动API服务器
     pub async fn start(&self, host: &str, port: u16) -> Result<(), Box<dyn Error>> {
+        // 构建所有API路由
+        let routes = self.build_routes();
+            
+        println!("启动主节点API服务器在 http://{}:{}...", host, port);
+        let socket_addr: std::net::SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .map_err(|e| format!("无效的地址: {}", e))?;
+            
+        warp::serve(routes)
+            .run(socket_addr)
+            .await;
+            
+        Ok(())
+    }
+    
+    // 构建所有API路由
+    fn build_routes(&self) -> impl Filter<Extract = impl warp::Reply, Error = Infallible> + Clone {
         // 健康检查路由
         let health_route = warp::path!("api" / "v1" / "health")
             .and(warp::get())
@@ -228,6 +313,44 @@ impl MasterServer {
                 handle_stats(query, db).await
             });
 
+        // 连接查询路由
+        let connections_route = warp::path!("api" / "v1" / "connections")
+            .and(warp::get())
+            .and(self.with_auth())
+            .and(warp::query::<ConnectionsQuery>())
+            .and(self.with_db())
+            .and_then(|query: ConnectionsQuery, db: Arc<crate::db::Database>| async move {
+                handle_connections(query, db).await
+            });
+
+        // 代理节点查询路由
+        let agents_route = warp::path!("api" / "v1" / "agents")
+            .and(warp::get())
+            .and(self.with_auth())
+            .and(self.with_db())
+            .and_then(|db: Arc<crate::db::Database>| async move {
+                handle_agents(db).await
+            });
+
+        // 代理节点状态查询路由
+        let agent_status_route = warp::path!("api" / "v1" / "agents" / String / "status")
+            .and(warp::get())
+            .and(self.with_auth())
+            .and(self.with_db())
+            .and_then(|agent_id: String, db: Arc<crate::db::Database>| async move {
+                handle_agent_status(agent_id, db).await
+            });
+
+        // 筛选器选项查询路由
+        let filter_options_route = warp::path!("api" / "v1" / "filter-options")
+            .and(warp::get())
+            .and(self.with_auth())
+            .and(warp::query::<FilterOptionsQuery>())
+            .and(self.with_db())
+            .and_then(|query: FilterOptionsQuery, db: Arc<crate::db::Database>| async move {
+                handle_filter_options(query, db).await
+            });
+
         // 配置 CORS
         let cors = warp::cors()
             .allow_any_origin()
@@ -236,56 +359,16 @@ impl MasterServer {
             .allow_credentials(false);
             
         // 合并所有路由并添加 CORS 和错误处理
-        let routes = health_route
+        health_route
             .or(sync_route)
             .or(stats_route)
+            .or(connections_route)
+            .or(agents_route)
+            .or(agent_status_route)
+            .or(filter_options_route)
             .with(cors)
-            .recover(handle_rejection);
-            
-        println!("启动主节点API服务器在 {}:{}...", host, port);
-        let socket_addr: std::net::SocketAddr = format!("{}:{}", host, port)
-            .parse()
-            .map_err(|e| format!("无效的地址: {}", e))?;
-            
-        warp::serve(routes)
-            .run(socket_addr)
-            .await;
-            
-        Ok(())
+            .recover(handle_rejection)
     }
-}
-
-// API错误类型
-#[allow(dead_code)]
-#[derive(Debug)]
-enum ApiError {
-    Unauthorized,                // 未授权
-    BadRequest(String),          // 请求参数错误
-    DatabaseError(String),       // 数据库错误
-    NotFound,                    // 资源不存在
-    InternalError(String),       // 内部服务器错误
-}
-
-impl warp::reject::Reject for ApiError {}
-
-// 统一的统计查询参数
-#[derive(Deserialize, Debug)]
-struct StatsQuery {
-    r#type: String,               // 统计类型: summary, group, timeseries
-    group_by: Option<String>,     // 分组字段(用于group类型): network, rule, process, destination, geoip
-    interval: Option<String>,     // 时间间隔(用于timeseries类型): hour, day, week, month
-    metric: Option<String>,       // 统计指标: connections, download, upload, total
-    from: Option<String>,         // 开始时间，ISO 8601格式
-    to: Option<String>,           // 结束时间，ISO 8601格式
-    agent_id: Option<String>,     // 代理ID过滤
-    network: Option<String>,      // 网络类型过滤
-    rule: Option<String>,         // 规则过滤
-    process: Option<String>,      // 进程名过滤
-    destination: Option<String>,  // 目标地址过滤
-    geoip: Option<String>,        // 国家/地区过滤
-    limit: Option<u32>,           // 限制返回结果数量
-    sort_by: Option<String>,      // 排序字段
-    sort_order: Option<String>,   // 排序顺序 (asc, desc)
 }
 
 // 处理统计请求的统一入口
@@ -355,249 +438,220 @@ async fn handle_stats_group(
         )))
     };
     
-    // 确定分组字段对应的数据库列名
-    let (column_name, is_chains_field) = match group_field {
-        "network" => ("network", false),
-        "rule" => ("rule", false),
-        "process" => ("process", false),
-        "destination" => ("destination_ip", false),
-        "geoip" => ("destination_geoip", false),
-        "host" => ("host", false),
-        "chains" => ("chains", true), // 特殊处理，需要提取最后一个节点
-        _ => return Err(warp::reject::custom(ApiError::BadRequest(
-            format!("不支持的分组字段: {}", group_field)
-        )))
-    };
+    // 根据分组类型分发到专门的处理函数
+    match group_field {
+        "geoip" => handle_geoip_group(query.clone(), db).await,
+        "host" => handle_host_group(query.clone(), db).await,
+        "chains" => handle_chains_group(query.clone(), db).await,
+        "rule" => handle_rule_group(query.clone(), db).await,
+        _ => handle_standard_group(query.clone(), db, group_field).await
+    }
+}
+
+// 处理GEOIP分组
+async fn handle_geoip_group(
+    query: StatsQuery,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    // 查询原始连接数据
+    let base_sql = "SELECT id, destination_geoip, conn_download as download, conn_upload as upload FROM connections";
+    let (sql, params) = build_base_filter(base_sql, &query);
     
-    // 对于rule字段，我们需要做特殊处理，合并rule和rule_payload
-    let use_combined_rule = group_field == "rule";
-    
-    // 如果是chains字段，我们需要自定义SQL查询来提取最后一个节点
-    let base_sql = if use_combined_rule {
-        // 如果是按规则分组，我们合并rule和rule_payload字段
-        format!(
-            "SELECT rule, rule_payload, COUNT(*) as count, SUM(conn_download) as download, SUM(conn_upload) as upload FROM connections"
-        )
-    } else if is_chains_field {
-        // 对于chains字段，需要提取最后一个节点
-        // 注：此处使用SQLite的JSON函数，提取数组的最后一个元素
-        // SQLite 3.38.0及以上版本支持使用负索引 $[-1]
-        // 但我们使用更安全的方法，先获取数组为JSON文本，然后在Rust中处理
-        format!(
-            "SELECT 
-                chains,
+    // 执行GEOIP分组统计
+    match db.execute_geoip_stats(&sql, &params, query.sort_by.as_deref(), query.sort_order.as_deref(), query.limit).await {
+        Ok(results) => Ok(ApiResponse::success(results)),
+        Err(e) => {
+            eprintln!("GEOIP分组查询错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("GEOIP分组查询失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 处理主机分组
+async fn handle_host_group(
+    query: StatsQuery,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    // 构建主机查询SQL
+    let base_sql = r#"
+        SELECT 
+            COALESCE(NULLIF(host, ''), destination_ip) as host_display,
                 COUNT(*) as count, 
                 SUM(conn_download) as download, 
                 SUM(conn_upload) as upload 
-             FROM connections"
-        )
-    } else {
-        format!(
-            "SELECT {}, COUNT(*) as count, SUM(conn_download) as download, SUM(conn_upload) as upload FROM connections",
-            column_name
-        )
+        FROM connections
+    "#;
+    
+    let (mut sql, params) = build_base_filter(base_sql, &query);
+    
+    // 添加分组和排序
+    sql.push_str(" GROUP BY host_display");
+    
+    add_sort_clause(&mut sql, &query);
+    add_limit_clause(&mut sql, &query);
+    
+    // 执行查询
+    match db.execute_host_group_query(&sql, &params).await {
+        Ok(results) => Ok(ApiResponse::success(results)),
+        Err(e) => {
+            eprintln!("主机分组查询错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("主机分组查询失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 处理代理链路分组
+async fn handle_chains_group(
+    query: StatsQuery,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    // 构建链路查询SQL
+    let base_sql = r#"
+        SELECT 
+            chains,
+            COUNT(*) as count, 
+            SUM(conn_download) as download, 
+            SUM(conn_upload) as upload 
+        FROM connections
+    "#;
+    
+    let (mut sql, params) = build_base_filter(base_sql, &query);
+    
+    // 添加分组和排序
+    sql.push_str(" GROUP BY chains");
+    
+    add_sort_clause(&mut sql, &query);
+    add_limit_clause(&mut sql, &query);
+    
+    // 执行查询
+    match db.execute_group_query(&sql, &params).await {
+        Ok(results) => {
+            // 处理链路结果，提取最后节点
+            match db.process_chains_results(results, query.sort_by.as_deref(), query.sort_order.as_deref(), query.limit).await {
+                Ok(processed) => Ok(ApiResponse::success(processed)),
+                Err(e) => {
+                    eprintln!("链路分组结果处理错误: {:?}", e);
+                    Err(warp::reject::custom(ApiError::DatabaseError(
+                        format!("链路分组结果处理失败: {}", e)
+                    )))
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("链路分组查询错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("链路分组查询失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 处理规则分组
+async fn handle_rule_group(
+    query: StatsQuery,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    // 构建规则查询SQL
+    let base_sql = r#"
+        SELECT 
+            rule, rule_payload, 
+            COUNT(*) as count, 
+            SUM(conn_download) as download, 
+            SUM(conn_upload) as upload 
+        FROM connections
+    "#;
+    
+    let (mut sql, params) = build_base_filter(base_sql, &query);
+    
+    // 添加分组和排序
+    sql.push_str(" GROUP BY rule, rule_payload");
+    
+    add_sort_clause(&mut sql, &query);
+    add_limit_clause(&mut sql, &query);
+    
+    // 执行查询
+    match db.execute_group_query(&sql, &params).await {
+        Ok(results) => Ok(ApiResponse::success(results)),
+        Err(e) => {
+            eprintln!("规则分组查询错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("规则分组查询失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 处理标准分组
+async fn handle_standard_group(
+    query: StatsQuery,
+    db: Arc<crate::db::Database>,
+    group_field: &str,
+) -> ApiResult {
+    // 确定分组字段名和显示名称
+    let (column_name, sql_expression) = match group_field {
+        "network" => ("network", "network"),
+        "process" => ("process", "CASE WHEN process = '' OR process IS NULL THEN '进程为空' ELSE process END as process"),
+        "destination" => ("destination_ip", "destination_ip"),
+        _ => (group_field, group_field),
     };
+    
+    // 构建查询SQL
+    let base_sql = format!(
+        "SELECT {}, COUNT(*) as count, SUM(conn_download) as download, SUM(conn_upload) as upload FROM connections",
+        sql_expression
+    );
     
     let (mut sql, params) = build_base_filter(&base_sql, &query);
     
     // 添加分组和排序
-    if use_combined_rule {
-        sql.push_str(" GROUP BY rule, rule_payload"); // 按两个字段分组
-    } else if is_chains_field {
-        sql.push_str(" GROUP BY chains"); // 按chains分组
-    } else {
-        sql.push_str(&format!(" GROUP BY {}", column_name));
-    }
+    sql.push_str(&format!(" GROUP BY {}", column_name));
     
-    if let Some(sort_by) = &query.sort_by {
-        let sort_field = match sort_by.as_str() {
-            "count" => "count",
-            "download" => "download",
-            "upload" => "upload",
-            "total" => "(download + upload)",
-            _ => "count"
-        };
-        
-        let sort_order = match query.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC"
-        };
-        
-        sql.push_str(&format!(" ORDER BY {} {}", sort_field, sort_order));
-    } else {
-        // 默认排序 - 根据分组类型可能想要不同的默认排序
-        if let Some(metric) = &query.metric {
-            match metric.as_str() {
-                "connections" => sql.push_str(" ORDER BY count DESC"),
-                "download" => sql.push_str(" ORDER BY download DESC"),
-                "upload" => sql.push_str(" ORDER BY upload DESC"),
-                "total" => sql.push_str(" ORDER BY (download + upload) DESC"),
-                _ => sql.push_str(" ORDER BY count DESC")
-            }
-        } else {
-            sql.push_str(" ORDER BY count DESC");
-        }
-    }
-    
-    // 添加限制
-    if let Some(limit) = query.limit {
-        sql.push_str(&format!(" LIMIT {}", limit));
-    }
+    add_sort_clause(&mut sql, &query);
+    add_limit_clause(&mut sql, &query);
     
     // 执行查询
     match db.execute_group_query(&sql, &params).await {
-        Ok(mut results) => {
-            // 对于 rule 分组，我们需要在结果中合并 rule 和 rule_payload
-            if use_combined_rule {
-                results = results.into_iter().map(|mut item| {
-                    if let Some(obj) = item.as_object_mut() {
-                        // 获取 rule 和 rule_payload
-                        let rule = obj.get("rule").and_then(|r| r.as_str()).unwrap_or("").to_string();
-                        let payload = obj.get("rule_payload").and_then(|p| p.as_str()).unwrap_or("").to_string();
-                        
-                        // 创建组合规则值
-                        let combined_rule = if !payload.is_empty() {
-                            format!("{} ({})", rule, payload)
-                        } else {
-                            rule
-                        };
-                        
-                        // 更新 rule 字段并删除 rule_payload
-                        obj.insert("rule".to_string(), serde_json::Value::String(combined_rule));
-                        obj.remove("rule_payload");
-                    }
-                    item
-                }).collect();
-            }
-            
-            // 如果是chains分组，需要将last_node重命名为node
-            if is_chains_field {
-                results = results.into_iter().map(|mut item| {
-                    if let Some(obj) = item.as_object_mut() {
-                        if let Some(chains_value) = obj.remove("chains") {
-                            // 从chains中提取最后一个节点
-                            let node_value = if let Some(chains_str) = chains_value.as_str() {
-                                // 尝试解析JSON数组并获取最后一个元素
-                                let clean_chains = chains_str.trim().replace('\'', "\"");
-                                if let Ok(array) = serde_json::from_str::<Vec<String>>(&clean_chains) {
-                                    if !array.is_empty() {
-                                        serde_json::Value::String(array.last().unwrap().clone())
-                                    } else {
-                                        serde_json::Value::String("unknown".to_string())
-                                    }
-                                } else {
-                                    // 如果解析失败，保留原始值
-                                    serde_json::Value::String(chains_str.to_string())
-                                }
-                            } else {
-                                // 如果不是字符串，保留原始值
-                                chains_value
-                            };
-                            
-                            obj.insert("node".to_string(), node_value);
-                        }
-                    }
-                    item
-                }).collect();
-                
-                // 对结果按节点名称进行聚合
-                let mut node_stats: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-                
-                for item in results {
-                    if let Some(obj) = item.as_object() {
-                        if let (Some(node), Some(count), Some(download), Some(upload)) = (
-                            obj.get("node").and_then(|v| v.as_str()),
-                            obj.get("count").and_then(|v| v.as_i64()),
-                            obj.get("download").and_then(|v| v.as_i64()),
-                            obj.get("upload").and_then(|v| v.as_i64())
-                        ) {
-                            let entry = node_stats.entry(node.to_string()).or_insert_with(|| {
-                                serde_json::json!({
-                                    "node": node,
-                                    "count": 0,
-                                    "download": 0,
-                                    "upload": 0
-                                })
-                            });
-                            
-                            if let Some(entry_obj) = entry.as_object_mut() {
-                                // 更新计数
-                                if let Some(entry_count) = entry_obj.get("count").and_then(|v| v.as_i64()) {
-                                    entry_obj["count"] = serde_json::Value::Number(serde_json::Number::from(entry_count + count));
-                                }
-                                
-                                // 更新下载
-                                if let Some(entry_download) = entry_obj.get("download").and_then(|v| v.as_i64()) {
-                                    entry_obj["download"] = serde_json::Value::Number(serde_json::Number::from(entry_download + download));
-                                }
-                                
-                                // 更新上传
-                                if let Some(entry_upload) = entry_obj.get("upload").and_then(|v| v.as_i64()) {
-                                    entry_obj["upload"] = serde_json::Value::Number(serde_json::Number::from(entry_upload + upload));
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // 转换回列表并排序
-                let mut aggregated_results: Vec<serde_json::Value> = node_stats.values().cloned().collect();
-                
-                // 根据排序字段排序
+        Ok(results) => Ok(ApiResponse::success(results)),
+        Err(e) => {
+            eprintln!("标准分组查询错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("标准分组查询失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 添加排序子句
+fn add_sort_clause(sql: &mut String, query: &StatsQuery) {
                 if let Some(sort_by) = &query.sort_by {
                     let sort_field = match sort_by.as_str() {
                         "count" => "count",
                         "download" => "download",
                         "upload" => "upload",
-                        "total" => "total", // 这里会使用下面添加的total字段
+            "total" => "(download + upload)",
                         _ => "count"
                     };
                     
                     let sort_order = match query.sort_order.as_deref() {
-                        Some("asc") => true,
-                        _ => false  // 默认降序
-                    };
-                    
-                    aggregated_results.sort_by(|a, b| {
-                        let a_val = a.get(sort_field).and_then(|v| v.as_i64()).unwrap_or(0);
-                        let b_val = b.get(sort_field).and_then(|v| v.as_i64()).unwrap_or(0);
-                        
-                        if sort_order {
-                            a_val.cmp(&b_val)  // 升序
+            Some("asc") => "ASC",
+            _ => "DESC"
+        };
+        
+        sql.push_str(&format!(" ORDER BY {} {}", sort_field, sort_order));
                         } else {
-                            b_val.cmp(&a_val)  // 降序
+        // 默认排序
+        sql.push_str(" ORDER BY count DESC");
                         }
-                    });
                 }
                 
-                // 应用limit
+// 添加限制子句
+fn add_limit_clause(sql: &mut String, query: &StatsQuery) {
                 if let Some(limit) = query.limit {
-                    if (limit as usize) < aggregated_results.len() {
-                        aggregated_results.truncate(limit as usize);
-                    }
-                }
-                
-                results = aggregated_results;
-            }
-            
-            // 为每个结果添加 total 字段
-            results = results.into_iter().map(|mut item| {
-                if let Some(obj) = item.as_object_mut() {
-                    let download = obj.get("download").and_then(|d| d.as_i64()).unwrap_or(0);
-                    let upload = obj.get("upload").and_then(|u| u.as_i64()).unwrap_or(0);
-                    obj.insert("total".to_string(), serde_json::Value::Number(serde_json::Number::from(download + upload)));
-                }
-                item
-            }).collect();
-            
-            Ok(ApiResponse::success(results))
-        },
-        Err(e) => {
-            eprintln!("分组统计查询错误: {:?}", e);
-            Err(warp::reject::custom(ApiError::DatabaseError(
-                format!("分组统计查询失败: {}", e)
-            )))
-        }
+        sql.push_str(&format!(" LIMIT {}", limit));
     }
 }
 
@@ -649,7 +703,7 @@ async fn handle_stats_timeseries(
     
     // 构建查询SQL
     let base_sql = format!(
-        "SELECT strftime('{}', datetime(last_updated)) as time_point, {} FROM connections",
+        "SELECT strftime('{}', datetime(last_updated, 'utc')) as time_point, {} FROM connections",
         time_format, select_expr
     );
     
@@ -701,35 +755,12 @@ fn build_base_filter(base_sql: &str, query: &StatsQuery) -> (String, Vec<String>
     }
     
     // 添加其他筛选条件
-    if let Some(agent_id) = &query.agent_id {
-        sql.push_str(" AND agent_id = ?");
-        params.push(agent_id.clone());
-    }
-    
-    if let Some(network) = &query.network {
-        sql.push_str(" AND network = ?");
-        params.push(network.clone());
-    }
-    
-    if let Some(rule) = &query.rule {
-        sql.push_str(" AND rule = ?");
-        params.push(rule.clone());
-    }
-    
-    if let Some(process) = &query.process {
-        sql.push_str(" AND process LIKE ?");
-        params.push(format!("%{}%", process));
-    }
-    
-    if let Some(destination) = &query.destination {
-        sql.push_str(" AND destination_ip LIKE ?");
-        params.push(format!("%{}%", destination));
-    }
-    
-    if let Some(geoip) = &query.geoip {
-        sql.push_str(" AND destination_geoip LIKE ?");
-        params.push(format!("%{}%", geoip));
-    }
+    crate::db::add_filter_condition(&mut sql, &mut params, "agent_id", &query.agent_id, "=");
+    crate::db::add_filter_condition(&mut sql, &mut params, "network", &query.network, "=");
+    crate::db::add_filter_condition(&mut sql, &mut params, "rule", &query.rule, "=");
+    crate::db::add_filter_condition_with_wildcards(&mut sql, &mut params, "process", &query.process, "LIKE", true);
+    crate::db::add_filter_condition_with_wildcards(&mut sql, &mut params, "destination_ip", &query.destination, "LIKE", true);
+    crate::db::add_filter_condition_with_wildcards(&mut sql, &mut params, "destination_geoip", &query.geoip, "LIKE", true);
     
     (sql, params)
 }
@@ -760,6 +791,443 @@ async fn handle_sync(
     }
 }
 
+// 处理连接查询请求
+async fn handle_connections(
+    query: ConnectionsQuery,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    // 构建基础SQL
+    let base_sql = r#"
+        SELECT 
+            id, conn_download as download, conn_upload as upload, 
+            last_updated, start, network, type as conn_type, 
+            source_ip, destination_ip, destination_geoip, source_port, 
+            destination_port, COALESCE(NULLIF(host, ''), destination_ip) as host, 
+            CASE WHEN process = '' OR process IS NULL THEN '进程为空' ELSE process END as process, 
+            chains, rule, rule_payload, agent_id
+        FROM connections
+    "#;
+    
+    // 构建查询条件
+    let (sql, params) = build_connections_filter(base_sql, &query);
+    
+    // 执行查询
+    match db.execute_connections_query(&sql, &params).await {
+        Ok(connections) => {
+            Ok(ApiResponse::success(connections))
+        },
+        Err(e) => {
+            eprintln!("连接查询错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("连接查询失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 构建连接查询条件
+fn build_connections_filter(base_sql: &str, query: &ConnectionsQuery) -> (String, Vec<String>) {
+    let mut sql = base_sql.to_string();
+    let mut conditions = Vec::new();
+    let mut params = Vec::new();
+    
+    // 添加筛选条件
+    if let Some(agent_id) = &query.agent_id {
+        conditions.push("agent_id = ?".to_string());
+        params.push(agent_id.clone());
+    }
+    
+    if let Some(network) = &query.network {
+        conditions.push("network = ?".to_string());
+        params.push(network.clone());
+    }
+    
+    if let Some(rule) = &query.rule {
+        conditions.push("rule = ?".to_string());
+        params.push(rule.clone());
+    }
+    
+    if let Some(process) = &query.process {
+        // 处理空进程的特殊情况
+        if process == "进程为空" {
+            conditions.push("(process = '' OR process IS NULL)".to_string());
+        } else {
+            conditions.push("process LIKE ?".to_string());
+        params.push(format!("%{}%", process));
+        }
+    }
+    
+    if let Some(destination) = &query.destination {
+        conditions.push("(destination_ip LIKE ? OR host LIKE ?)".to_string());
+        params.push(format!("%{}%", destination));
+        params.push(format!("%{}%", destination));
+    }
+    
+    if let Some(host) = &query.host {
+        conditions.push("host LIKE ?".to_string());
+        params.push(format!("%{}%", host));
+    }
+    
+    if let Some(geoip) = &query.geoip {
+        conditions.push("destination_geoip LIKE ?".to_string());
+        params.push(format!("%\"{}%", geoip)); // 使用JSON包含匹配
+    }
+    
+    if let Some(from) = &query.from {
+        conditions.push("start >= ?".to_string());
+        params.push(from.clone());
+    }
+    
+    if let Some(to) = &query.to {
+        conditions.push("start <= ?".to_string());
+        params.push(to.clone());
+    }
+    
+    // 添加WHERE子句
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+    
+    // 添加排序
+    if let Some(sort_by) = &query.sort_by {
+        let column = match sort_by.as_str() {
+            "download" => "conn_download",
+            "upload" => "conn_upload",
+            "start" => "start",
+            "last_updated" => "last_updated",
+            _ => "last_updated", // 默认按最后更新时间排序
+        };
+        
+        let sort_order = match query.sort_order.as_deref() {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+        
+        sql.push_str(&format!(" ORDER BY {} {}", column, sort_order));
+    } else {
+        // 默认按最后更新时间排序
+        sql.push_str(" ORDER BY last_updated DESC");
+    }
+    
+    // 添加分页
+    if let Some(limit) = query.limit {
+        sql.push_str(&format!(" LIMIT {}", limit));
+        
+        if let Some(offset) = query.offset {
+            sql.push_str(&format!(" OFFSET {}", offset));
+        }
+    } else {
+        // 默认限制100条记录
+        sql.push_str(" LIMIT 100");
+    }
+    
+    (sql, params)
+}
+
+// 处理代理节点相关请求
+async fn handle_agents(
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    match db.get_agents().await {
+        Ok(agents) => {
+            Ok(ApiResponse::success(agents))
+        },
+        Err(e) => {
+            eprintln!("获取代理节点列表错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取代理节点列表失败: {}", e)
+            )))
+        }
+    }
+}
+
+async fn handle_agent_status(
+    agent_id: String,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    match db.get_agent_status(&agent_id).await {
+        Ok(status) => {
+            Ok(ApiResponse::success(status))
+        },
+        Err(e) => {
+            eprintln!("获取代理节点状态错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取代理节点状态失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 处理筛选器选项请求
+async fn handle_filter_options(
+    query: FilterOptionsQuery,
+    db: Arc<crate::db::Database>,
+) -> ApiResult {
+    // 根据筛选类型执行不同的查询
+    match query.filter_type.as_str() {
+        "agent_id" => get_agent_id_options(db, query.query, query.limit).await,
+        "network" => get_network_options(db, query.query, query.limit).await,
+        "rule" => get_rule_options(db, query.query, query.limit).await,
+        "process" => get_process_options(db, query.query, query.limit).await,
+        "destination" => get_destination_options(db, query.query, query.limit).await,
+        "host" => get_host_options(db, query.query, query.limit).await,
+        "geoip" => get_geoip_options(db, query.query, query.limit).await,
+        _ => Err(warp::reject::custom(ApiError::BadRequest(
+            format!("不支持的筛选类型: {}", query.filter_type)
+        )))
+    }
+}
+
+// 获取代理ID选项
+async fn get_agent_id_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    let mut sql = "SELECT DISTINCT agent_id FROM connections WHERE agent_id IS NOT NULL".to_string();
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        sql.push_str(" AND agent_id LIKE ?");
+        params.push(format!("%{}%", q));
+    }
+    
+    sql.push_str(" ORDER BY agent_id");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取代理ID选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取代理ID选项失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 获取网络类型选项
+async fn get_network_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    let mut sql = "SELECT DISTINCT network FROM connections WHERE network IS NOT NULL".to_string();
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        sql.push_str(" AND network LIKE ?");
+        params.push(format!("%{}%", q));
+    }
+    
+    sql.push_str(" ORDER BY network");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取网络类型选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取网络类型选项失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 获取规则选项
+async fn get_rule_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    let mut sql = "SELECT DISTINCT rule FROM connections WHERE rule IS NOT NULL".to_string();
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        sql.push_str(" AND rule LIKE ?");
+        params.push(format!("%{}%", q));
+    }
+    
+    sql.push_str(" ORDER BY rule");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取规则选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取规则选项失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 获取进程选项
+async fn get_process_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    let mut sql = "SELECT DISTINCT CASE WHEN process = '' OR process IS NULL THEN '进程为空' ELSE process END as process FROM connections".to_string();
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        if q == "进程为空" {
+            sql.push_str(" WHERE (process = '' OR process IS NULL)");
+        } else {
+            sql.push_str(" WHERE process LIKE ?");
+            params.push(format!("%{}%", q));
+        }
+    }
+    
+    sql.push_str(" ORDER BY process");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取进程选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取进程选项失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 获取目标地址选项
+async fn get_destination_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    let mut sql = "SELECT DISTINCT destination_ip FROM connections WHERE destination_ip IS NOT NULL".to_string();
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        sql.push_str(" AND destination_ip LIKE ?");
+        params.push(format!("%{}%", q));
+    }
+    
+    sql.push_str(" ORDER BY destination_ip");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取目标地址选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取目标地址选项失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 获取主机选项
+async fn get_host_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    let mut sql = "SELECT DISTINCT host FROM connections WHERE host IS NOT NULL AND host != ''".to_string();
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        sql.push_str(" AND host LIKE ?");
+        params.push(format!("%{}%", q));
+    }
+    
+    sql.push_str(" ORDER BY host");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取主机选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取主机选项失败: {}", e)
+            )))
+        }
+    }
+}
+
+// 获取GeoIP选项
+async fn get_geoip_options(
+    db: Arc<crate::db::Database>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> ApiResult {
+    // 由于GeoIP存储为JSON，需要特殊处理
+    let mut sql = r#"
+    WITH extracted_geoip AS (
+        SELECT DISTINCT 
+            json_extract(destination_geoip, '$.country') as country,
+            json_extract(destination_geoip, '$.countryCode') as country_code
+        FROM connections 
+        WHERE destination_geoip IS NOT NULL AND destination_geoip != '{}'
+    )
+    SELECT country || ' (' || country_code || ')' as geoip 
+    FROM extracted_geoip
+    WHERE country IS NOT NULL AND country_code IS NOT NULL
+    "#.to_string();
+    
+    let mut params: Vec<String> = Vec::new();
+    
+    // 添加查询条件
+    if let Some(q) = query {
+        sql.push_str(" AND (country LIKE ? OR country_code LIKE ?)");
+        params.push(format!("%{}%", q));
+        params.push(format!("%{}%", q));
+    }
+    
+    sql.push_str(" ORDER BY country");
+    
+    // 添加限制
+    if let Some(lim) = limit {
+        sql.push_str(&format!(" LIMIT {}", lim));
+    }
+    
+    match db.execute_filter_options_query(&sql, &params).await {
+        Ok(options) => Ok(ApiResponse::success(options)),
+        Err(e) => {
+            eprintln!("获取GeoIP选项错误: {:?}", e);
+            Err(warp::reject::custom(ApiError::DatabaseError(
+                format!("获取GeoIP选项失败: {}", e)
+            )))
+        }
+    }
+}
+
 // 处理请求错误
 async fn handle_rejection(err: warp::Rejection) -> Result<impl warp::Reply, Infallible> {
     let (code, message) = if err.is_not_found() {
@@ -783,11 +1251,7 @@ async fn handle_rejection(err: warp::Rejection) -> Result<impl warp::Reply, Infa
     };
     
     Ok(warp::reply::with_status(
-        warp::reply::json(&json!({
-            "status": "error",
-            "data": null,
-            "message": message,
-        })),
+        ApiResponse::<()>::error(&message),
         code
     ))
 } 

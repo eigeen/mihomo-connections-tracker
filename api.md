@@ -90,7 +90,8 @@ POST /api/v1/sync
 {
   "status": "success",
   "data": {
-    "records_processed": 1
+    "message": "数据同步成功",
+    "count": 1
   },
   "message": null
 }
@@ -286,7 +287,100 @@ GET /api/v1/stats
 }
 ```
 
-### 3.5 错误处理
+### 3.5 连接数据 API (已实现)
+
+> 注意：这是一个新增的API端点，用于获取活跃连接数据。
+
+```
+GET /api/v1/connections
+```
+
+获取当前活跃的连接数据列表，支持过滤和分页。
+
+**查询参数**:
+
+| 参数 | 类型 | 描述 | 示例 |
+|------|------|------|------|
+| from | string | 开始时间 (ISO 8601格式) | `from=2023-01-01T00:00:00Z` |
+| to | string | 结束时间 (ISO 8601格式) | `to=2023-01-31T23:59:59Z` |
+| agent_id | string | 按代理ID过滤 | `agent_id=my-agent` |
+| network | string | 按网络类型过滤 | `network=TCP` |
+| rule | string | 按规则过滤 | `rule=DIRECT` |
+| process | string | 按进程名过滤 | `process=chrome` |
+| destination | string | 按目标地址过滤 | `destination=8.8.8.8` |
+| geoip | string | 按国家/地区过滤 | `geoip=CN` |
+| limit | number | 限制返回结果数量 | `limit=50` |
+| offset | number | 分页偏移 | `offset=0` |
+| sort_by | string | 排序字段: start, download, upload, total | `sort_by=download` |
+| sort_order | string | 排序顺序: asc, desc | `sort_order=desc` |
+
+**响应**:
+```json
+{
+  "status": "success",
+  "data": [
+    {
+      "id": "6c5cef8b-db4d",
+      "agent_id": "my-agent-1",
+      "download": 102400,
+      "upload": 51200,
+      "last_updated": "2023-01-01T12:30:45.123Z",
+      "start": "2023-01-01T12:30:00.000Z",
+      "network": "TCP",
+      "conn_type": "HTTP",
+      "source_ip": "192.168.1.100",
+      "destination_ip": "203.0.113.1",
+      "destination_geoip": "US",
+      "source_port": "52100",
+      "destination_port": "443",
+      "host": "example.com",
+      "process": "chrome",
+      "chains": "[\"DIRECT\"]",
+      "rule": "DIRECT",
+      "rule_payload": ""
+    },
+    // ...更多连接数据
+  ],
+  "total_count": 127, // 总记录数
+  "message": null
+}
+```
+
+### 3.6 代理节点管理 API (已实现)
+
+```
+GET /api/v1/agents
+```
+
+获取所有代理节点的状态信息。
+
+**响应**:
+```json
+{
+  "status": "success",
+  "data": [
+    {
+      "agent_id": "my-agent-1",
+      "last_sync": "2023-01-01T12:30:50.000Z",
+      "connection_count": 27,
+      "total_download": 1024000000,
+      "total_upload": 512000000,
+      "status": "online"
+    },
+    {
+      "agent_id": "my-agent-2",
+      "last_sync": "2023-01-01T12:29:50.000Z",
+      "connection_count": 15,
+      "total_download": 512000000,
+      "total_upload": 256000000,
+      "status": "online"
+    }
+  ],
+  "message": null
+}
+```
+
+### 3.7 错误处理
 
 当请求不成功时，API 将返回适当的 HTTP 状态码和错误消息:
 
@@ -339,308 +433,226 @@ GET /api/v1/stats
 | rule_payload | string | 规则载荷 |
 | agent_id | string | 代理节点ID |
 
-## 5. 前端开发指南
+## 5. 已实现的前端组件
 
-### 5.1 技术栈建议
+### 5.1 主要组件
 
-- **框架**: React/Vue.js/Angular
-- **UI库**: Ant Design/Element UI/Material UI
-- **图表库**: ECharts/Chart.js/D3.js
-- **状态管理**: Redux/Vuex/MobX
-- **API请求**: Axios/Fetch API
+前端已实现以下核心组件，提供了完整的数据可视化和交互体验：
 
-### 5.2 主要页面/组件
+#### 5.1.1 仪表盘 (Dashboard)
 
-#### 5.2.1 仪表盘
+- 总览页面，包含统计卡片、分组统计和时间序列图表
+- 基于选项卡的设计，支持切换不同数据视图
+- 支持切换到连接列表和代理节点视图
 
-- 总览卡片（活跃连接数、总流量、上传/下载流量）
-- 流量趋势图（24小时/7天/30天）
-- 地理分布地图（基于destination_geoip）
-- 热门应用/进程排行
-- 热门目标域名/IP排行
+#### 5.1.2 统计卡片 (StatCards)
 
-#### 5.2.2 连接列表
+- 显示关键数据指标：连接总数、总流量、下载和上传流量
+- 支持刷新数据
+- 根据当前过滤条件动态更新
 
-- 实时连接列表（支持分页、搜索和排序）
-- 每个连接的详细信息（包括源/目标、规则、流量等）
-- 流量实时更新指示
-- 支持按不同条件过滤（网络类型、规则、进程等）
+#### 5.1.3 分组统计 (GroupedStats)
 
-#### 5.2.3 统计分析
+- 支持按多个维度分组数据：国家/地区、规则、进程、网络类型、代理链路、目标IP和主机
+- 提供条形图和表格两种显示模式
+- 自动对数据进行排序，突出显示重要数据
 
-- 按不同维度的数据透视图（规则、地理位置、应用等）
-- 流量时间序列分析
-- 自定义时间范围选择器
-- 可导出的数据报表
+#### 5.1.4 时间序列统计 (TimeSeriesStats)
 
-#### 5.2.4 节点管理（可选）
+- 支持按小时、天、周、月不同时间粒度显示数据
+- 支持选择不同指标：连接数、下载、上传和总流量
+- 包含缩略导航条，方便查看更长时间范围的数据
 
-- Agent节点列表和状态监控
-- 每个节点的连接数据独立视图
-- 节点同步状态监控
+#### 5.1.5 连接列表 (ConnectionsList)
 
-### 5.3 数据获取和刷新策略
+- 显示详细的连接数据，包括源/目标、规则、流量等信息
+- 支持搜索、过滤和排序
+- 实时刷新显示连接状态
 
-- 仪表盘数据：每30秒自动刷新一次
-- 连接列表：实时数据或每5-10秒刷新一次
-- 统计分析：按需加载，用户可手动刷新
-- 考虑使用WebSocket实现实时数据更新（如果后端支持）
+#### 5.1.6 过滤器 (FiltersPopover)
 
-### 5.4 前端认证处理
+- 提供统一的过滤界面，支持按多种条件筛选数据
+- 包含日期范围选择器，支持选择自定义时间段
+- 所有筛选条件在不同组件间共享，保持一致性
 
-```javascript
-// Axios 请求示例（带认证）
-import axios from 'axios';
+#### 5.1.7 设置对话框 (SettingsDialog)
 
-const api = axios.create({
-  baseURL: 'http://<master-host>:<master-port>/api/v1',
-  timeout: 10000,
-});
+- 提供应用设置界面，包括API URL和令牌配置
+- 支持暗/亮主题切换
+- 支持保存用户偏好设置
 
-// 添加认证令牌
-api.interceptors.request.use(config => {
-  const token = localStorage.getItem('api_token');
-  if (token) {
-    config.headers['Authorization'] = `Bearer ${token}`;
-  }
-  return config;
-});
+### 5.2 技术栈实现
 
-// 调用API示例
-async function fetchStatsSummary() {
-  try {
-    const response = await api.get('/stats', {
-      params: { type: 'summary' }
-    });
-    return response.data.data;
-  } catch (error) {
-    console.error('获取统计摘要失败:', error);
-    throw error;
-  }
+前端使用以下技术栈实现：
+
+- **框架**: React 18 + Next.js 14
+- **UI库**: Shadcn UI (基于Tailwind CSS)
+- **图表库**: Recharts
+- **状态管理**: React Context API
+- **API请求**: 原生Fetch API
+- **编程语言**: TypeScript
+
+## 6. 前端界面设计
+
+### 6.1 布局结构
+
+前端界面采用现代化的布局结构：
+
+1. **顶部导航栏**
+   - 应用标题和logo
+   - 主题切换按钮
+   - 设置按钮
+
+2. **主要标签栏**
+   - 概览标签（默认）
+   - 连接标签
+   - 代理节点标签
+
+3. **概览页面**
+   - 统计卡片（第一行）
+   - 全局过滤器和日期选择器
+   - 分组统计图表/表格
+   - 时间序列图表
+
+4. **连接列表页面**
+   - 连接搜索和过滤器
+   - 可分页的连接表格
+   - 刷新按钮
+
+5. **代理节点页面**
+   - 代理节点状态卡片
+   - 节点详情和统计信息
+
+### 6.2 响应式设计
+
+界面已实现完全响应式设计：
+
+- 在桌面端提供最完整的布局，充分利用屏幕空间
+- 在平板设备上，卡片自动调整为流式布局
+- 在移动设备上，组件垂直堆叠，保持良好的可读性和可用性
+
+## 7. 开发实践
+
+### 7.1 API集成
+
+前端已实现与所有API端点的完整集成：
+
+```typescript
+// API 客户端示例
+export async function fetchStatsSummary(filters = {}) {
+  const queryParams = new URLSearchParams({
+    type: "summary",
+    ...filters,
+  })
+
+  return apiRequest(`/stats?${queryParams.toString()}`)
+}
+
+export async function fetchGroupedStats(groupBy: string, filters = {}) {
+  const queryParams = new URLSearchParams({
+    type: "group",
+    group_by: groupBy,
+    sort_by: "total",
+    sort_order: "desc",
+    limit: "10",
+    ...filters,
+  })
+
+  return apiRequest(`/stats?${queryParams.toString()}`)
+}
+
+export async function fetchTimeSeriesStats(params: Record<string, any>) {
+  const { interval, metric, from, to, ...filters } = params
+
+  const queryParams = new URLSearchParams({
+    type: "timeseries",
+    interval: interval || "hour",
+    metric: metric || "total",
+    ...filters,
+  })
+
+  if (from) queryParams.append("from", from)
+  if (to) queryParams.append("to", to)
+
+  return apiRequest(`/stats?${queryParams.toString()}`)
 }
 ```
 
-### 5.5 数据可视化示例
+### 7.2 数据可视化
 
-```javascript
-// ECharts 地理分布图示例
-function renderGeoDistribution(data) {
-  const chart = echarts.init(document.getElementById('geo-chart'));
-  
-  const option = {
-    title: {
-      text: '连接地理分布',
-      subtext: '按国家/地区统计',
-      left: 'center'
-    },
-    tooltip: {
-      trigger: 'item',
-      formatter: '{b}: {c} ({d}%)'
-    },
-    visualMap: {
-      min: 0,
-      max: Math.max(...data.map(item => item.count)),
-      left: 'left',
-      top: 'bottom',
-      text: ['高', '低'],
-      calculable: true
-    },
-    series: [
-      {
-        name: '连接数',
-        type: 'map',
-        map: 'world',
-        roam: true,
-        emphasis: {
-          label: {
-            show: true
-          }
-        },
-        data: data.map(item => ({
-          name: item.destination_geoip,
-          value: item.count
-        }))
-      }
-    ]
-  };
-  
-  chart.setOption(option);
-}
-```
+前端使用Recharts库实现了丰富的数据可视化功能：
 
-### 5.6 前端界面设计方案
+- **条形图**：用于展示分组统计数据，便于比较不同分组值
+- **折线图**：用于展示时间序列数据，清晰展示趋势变化
+- **自定义图例和提示框**：增强数据可读性
+- **交互式缩放和平移**：支持探索大型数据集
+- **自动适应颜色**：根据数据类型和分组动态调整
 
-基于AdGuard Home风格的界面设计，将页面分为三个主要垂直板块：
+### 7.3 数据刷新策略
 
-#### 5.6.1 顶部统计总览（第一排）
+针对不同组件实现了优化的数据刷新策略：
 
-**布局**：4个等宽卡片横向排列，每个卡片包含以下元素：
-- 核心指标的醒目大数字
-- 配套图标和标题
-- 同比上期的增长/下降百分比（可选）
+- **统计卡片**：每30秒自动刷新一次
+- **连接列表**：每10秒自动刷新一次
+- **分组统计和时间序列**：根据用户交互按需刷新
+- **支持手动刷新**：每个组件都提供刷新按钮
 
-**卡片内容**：
-- **连接总数**：显示活跃连接数量
-- **总流量**：显示上传+下载总流量
-- **下载流量**：显示下载的数据总量
-- **上传流量**：显示上传的数据总量
+## 8. 部署指南
 
-**颜色方案**：
-- 连接总数：蓝色调
-- 总流量：紫色调
-- 下载流量：绿色调
-- 上传流量：橙色调
+### 8.1 前端部署
 
-#### 5.6.2 中部分组统计（第二排）
+1. **构建生产版本**：
+   ```bash
+   cd frontend
+   npm run build
+   ```
 
-**布局**：一个宽卡片面板，包含：
-- 顶部控制栏（分组字段选择器、图表类型切换按钮）
-- 主体是横向条形图
+2. **部署静态文件**：
+   - 将`frontend/out`目录下的文件部署到Web服务器
+   - 或使用Vercel/Netlify等服务托管
 
-**功能元素**：
-- **分组字段选择器**：下拉菜单，选项包括：
-  - 规则(rule)
-  - 地理位置(geoip)
-  - 应用程序(process)
-  - 网络类型(network)
-  - 代理链路(chains)
-  - 目标地址(destination)
-  - 主机名(host)
+3. **配置API地址**：
+   - 在前端访问时，初始设置界面配置API地址和令牌
+   - 设置保存在浏览器本地存储中
 
-- **图表类型切换**：图标按钮组，选项包括：
-  - 横向条形图（默认）
-  - 饼图
-  - 表格视图
+### 8.2 后端部署
 
-**图表展示**：
-- 横向条形图，每条包含：
-  - 左侧显示分组名称（如国家名称、规则名称等）
-  - 右侧是条形图，长度代表数值大小
-  - 条形末端显示具体数值
-  - 不同的指标用不同颜色区分（连接数、下载、上传）
+1. **构建后端**：
+   ```bash
+   cd backend
+   cargo build --release
+   ```
 
-**交互功能**：
-- 鼠标悬停显示详细信息（包括连接数、下载、上传等全部指标）
-- 点击某个分组项可以进入该分组的详细数据页面
+2. **启动主节点**：
+   ```bash
+   ./target/release/mihomo-connections-tracker master \
+     --host 0.0.0.0 \
+     --port 8080 \
+     --db-path /data/connections.db \
+     --api-token YOUR_SECRET_TOKEN
+   ```
 
-#### 5.6.3 底部时间序列（第三排）
+3. **启动从节点**：
+   ```bash
+   ./target/release/mihomo-connections-tracker agent \
+     --mihomo-host 127.0.0.1 \
+     --mihomo-port 9090 \
+     --mihomo-token YOUR_MIHOMO_TOKEN \
+     --master-url http://master-host:8080 \
+     --master-token YOUR_SECRET_TOKEN \
+     --agent-id my-unique-agent-id
+   ```
 
-**布局**：单个大型卡片，包含：
-- 顶部控制栏（时间间隔选择、指标选择、日期范围选择器）
-- 主体为折线图区域
+## 9. 性能优化
 
-**功能元素**：
-- **时间间隔选择器**：标签页式切换，选项包括：
-  - 按小时(hour)
-  - 按天(day)
-  - 按周(week)
-  - 按月(month)
+为保证系统在大量连接数据下的性能，已实现以下优化：
 
-- **指标选择器**：下拉菜单，选项包括：
-  - 连接数(connections)
-  - 下载流量(download)
-  - 上传流量(upload)
-  - 总流量(total)
-
-- **日期范围选择器**：日历控件，可选择查询的时间范围
-
-**图表展示**：
-- 折线图，x轴为时间，y轴为所选指标值
-- 可选择显示平滑曲线或直线
-- 图表下方有迷你缩略图，可拖动选择查看区域
-
-**交互功能**：
-- 鼠标悬停显示具体时间点的详细数据
-- 支持缩放和平移操作
-- 点击图例可以切换显示/隐藏某些数据系列
-
-#### 5.6.4 响应式设计
-
-- 在桌面端，三个板块垂直排列，每个板块占据全宽
-- 在平板端，保持垂直排列但减少边距和内边距
-- 在移动端，调整卡片为单列布局，图表自动缩放
-
-#### 5.6.5 设计示意图
-
-```
-+---------------------------------------------------------------------+
-|                                                                     |
-|  +----------+    +----------+    +----------+    +----------+       |
-|  | 连接总数  |    |  总流量   |    | 下载流量  |    | 上传流量  |       |
-|  |  2,345   |    |  4.2 GB  |    |  3.1 GB  |    |  1.1 GB  |       |
-|  |  +10%    |    |   +5%    |    |   +3%    |    |   +12%   |       |
-|  +----------+    +----------+    +----------+    +----------+       |
-|                                                                     |
-|  +------------------------------------------------------------------+
-|  | 分组统计                                   [网络] [条形图] [刷新] |
-|  |                                                                  |
-|  |  中国(CN)  |████████████████████████|  1.2 GB                    |
-|  |  美国(US)  |████████████████|  850 MB                            |
-|  |  香港(HK)  |███████████|  650 MB                                 |
-|  |  新加坡(SG)|██████|  350 MB                                      |
-|  |  日本(JP)  |█████|  300 MB                                       |
-|  |                                                                  |
-|  +------------------------------------------------------------------+
-|                                                                     |
-|  +------------------------------------------------------------------+
-|  | 时间序列统计   [小时] [天] [周] [月]  [总流量▼]  [2023-10-01 ~ 2023-10-07] |
-|  |                                                                  |
-|  |    ^                                                             |
-|  |    |                     ●                                       |
-|  |    |                ●         ●       ●                          |
-|  |    |           ●                  ●       ●                      |
-|  |    |       ●                                                     |
-|  |    |   ●                                                         |
-|  |    +------------------------------------------------------------->|
-|  |    00:00   04:00   08:00   12:00   16:00   20:00   00:00        |
-|  |                                                                  |
-|  |  [缩略导航条...................................................] |
-|  +------------------------------------------------------------------+
-|                                                                     |
-+---------------------------------------------------------------------+
-```
-
-## 6. 开发建议和最佳实践
-
-1. **封装API调用**：创建统一的API服务层，处理认证、错误处理和数据转换
-2. **适配移动设备**：确保UI响应式设计，支持桌面和移动设备访问
-3. **数据缓存策略**：实现适当的缓存策略减少重复请求，提高用户体验
-4. **错误处理**：完善的错误处理和用户友好的错误提示
-5. **国际化支持**：考虑多语言支持（至少中英文）
-6. **主题支持**：提供明暗两种主题模式
-7. **性能优化**：
-   - 列表虚拟滚动处理大量数据
-   - 组件懒加载
-   - 数据按需加载和分页
-
-## 7. 开发流程建议
-
-1. **设计阶段**：
-   - 创建基本UI/UX设计和页面布局
-   - 定义组件结构和层次关系
-   - 设计状态管理方案
-
-2. **开发阶段**：
-   - 实现基础组件和页面框架
-   - 集成API调用和数据获取
-   - 开发数据可视化组件
-   - 实现实时更新功能
-
-3. **测试阶段**：
-   - 开发环境下进行单元测试和集成测试
-   - 测试不同数据量下的性能表现
-   - 测试不同网络条件下的应用行为
-
-4. **部署阶段**：
-   - 构建生产版本
-   - 配置与后端服务的集成
-   - 监控和优化
-
-## 8. 运行环境要求
-
-- 支持现代浏览器（Chrome、Firefox、Safari、Edge等）
-- 同源部署或配置CORS（已在后端支持）
-- 合理的客户端内存用量（考虑到可能的大量连接数据）
+1. **数据分页**：连接列表支持分页加载
+2. **按需加载**：图表和表格仅在需要时加载数据
+3. **数据缓存**：前端实现临时数据缓存减少重复请求
+4. **懒加载组件**：使用React的懒加载减少初始加载时间
+5. **SQL查询优化**：后端使用索引和优化查询提高数据库性能
+6. **数据清理**：自动清理旧数据减轻数据库负担
 
 ---
 

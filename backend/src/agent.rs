@@ -37,6 +37,7 @@ pub async fn run(config: AgentConfig) -> Result<(), Box<dyn Error>> {
         println!("  - 离线模式: 数据仅存储在本地");
     }
     println!("  - 同步间隔: {}秒", config.sync_interval);
+    println!("  - 数据保留天数: {}天", config.data_retention_days);
     
     // 创建MihomoAPI客户端
     let mihomo_client = MihomoClient::new(
@@ -73,8 +74,9 @@ pub async fn run(config: AgentConfig) -> Result<(), Box<dyn Error>> {
     if let Some(_) = &config.master_url {
         let sync_state = state.clone();
         let sync_interval = config.sync_interval;
+        let retention_days = config.data_retention_days;
         let _handle = tokio::spawn(async move {
-            if let Err(e) = sync_task(sync_state, sync_interval).await {
+            if let Err(e) = sync_task(sync_state, sync_interval, retention_days).await {
                 eprintln!("同步任务错误: {}", e);
             }
         });
@@ -116,7 +118,7 @@ pub async fn run(config: AgentConfig) -> Result<(), Box<dyn Error>> {
 }
 
 // 同步任务 - 定期将本地数据同步到主节点
-async fn sync_task(state: Arc<AgentState>, interval_secs: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn sync_task(state: Arc<AgentState>, interval_secs: u64, retention_days: i64) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut interval = interval(Duration::from_secs(interval_secs));
     
     loop {
@@ -134,6 +136,19 @@ async fn sync_task(state: Arc<AgentState>, interval_secs: u64) -> Result<(), Box
             Ok(count) => {
                 if count == 0 {
                     println!("没有需要同步的记录");
+                    
+                    // 即使没有新记录需要同步，也可以执行清理任务
+                    match state.db.cleanup_old_records(retention_days).await {
+                        Ok(deleted) => {
+                            if deleted > 0 {
+                                println!("已清理 {} 条超过{}天的旧数据", deleted, retention_days);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("清理旧数据失败: {:?}", e);
+                        }
+                    }
+                    
                     continue;
                 }
                 
@@ -181,6 +196,18 @@ async fn sync_task(state: Arc<AgentState>, interval_secs: u64) -> Result<(), Box
                             eprintln!("获取待同步记录失败: {:?}", e);
                             break;
                         }
+                    }
+                }
+                
+                // 在所有数据同步完成后，清理旧数据
+                match state.db.cleanup_old_records(retention_days).await {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            println!("已清理 {} 条超过{}天的旧数据", deleted, retention_days);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("清理旧数据失败: {:?}", e);
                     }
                 }
             },
